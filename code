@@ -1,0 +1,453 @@
+"""
+Robot 4-DOF (RRRR + Vacuum EE) - Stick Model + Jog Control
+Chuyen tu MATLAB sang Python (numpy + matplotlib).
+
+Cai dat:  pip install numpy matplotlib
+Chay:     python robot_arm_3d_line.py
+
+Phim tat: A/D: X-,X+   W/S: Y+,Y-   Q/E: Z+,Z-   R/F: Pitch +/-
+"""
+from collections import deque
+
+import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.widgets import Button, Slider
+
+# Tat cac phim tat mac dinh cua matplotlib de khong de len phim jog (s, q, f, r ...)
+for _k in ("keymap.save", "keymap.quit", "keymap.quit_all", "keymap.fullscreen",
+           "keymap.home", "keymap.back", "keymap.forward", "keymap.pan",
+           "keymap.zoom", "keymap.grid", "keymap.xscale", "keymap.yscale"):
+    if _k in plt.rcParams:
+        plt.rcParams[_k] = []
+
+# ---------- Thong so hinh hoc (m) ----------
+H_BASE = 0.15
+L1 = 1.6   # J1 -> J2
+L2 = 2.6   # J2 -> J3
+L3 = 2.3   # J3 -> J4
+L4 = 0.9   # J4 -> EE  (L4 gap len/xuong tai J4 - khop pitch)
+REACH = L2 + L3 + L4
+
+JOG_STEP = 0.10     # buoc jog (m)
+PITCH_STEP = 5      # buoc pitch dau hut (deg)
+
+# Gioi han khop (deg)
+Q_MIN = np.array([-170, -45, -120, -90], dtype=float)
+Q_MAX = np.array([170, 90, 30, 60], dtype=float)
+
+# ---------- Mau ----------
+COL_BG = (1, 1, 1)
+COL_GRID = (0.80, 0.84, 0.88)
+COL_TXT = (0.13, 0.17, 0.22)
+COL_L1 = (0.10, 0.35, 0.85)
+COL_L2 = (0.45, 0.25, 0.80)
+COL_L3 = (0.00, 0.55, 0.45)
+COL_L4 = (0.90, 0.45, 0.05)
+COL_JOINT = (0.20, 0.20, 0.20)
+COL_EE = (0.85, 0.10, 0.10)
+COL_TRAIL = (0.05, 0.45, 0.75)
+
+HOME_POSE = np.array([0, 35, -40, 0], dtype=float)
+
+KEYFRAMES = np.array([
+    [0, 35, -40, 5],
+    [-60, 55, -80, 25],
+    [-60, 70, -100, 30],
+    [-60, 70, -100, -20],
+    [-60, 40, -60, 20],
+    [60, 40, -60, 20],
+    [60, 65, -95, 30],
+    [60, 65, -95, -20],
+    [60, 40, -60, 20],
+    [0, 35, -40, 5],
+], dtype=float)
+
+
+# ---------- Dong hoc ----------
+def rz(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+
+
+def ry(a):
+    c, s = np.cos(a), np.sin(a)
+    return np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]])
+
+
+def forward_kinematics(q):
+    """Tra ve P (6x3: p0..p5) va toolBar (2x3)."""
+    t1, t2, t3, t4 = np.deg2rad(q)
+    p0 = np.array([0.0, 0.0, 0.0])
+    p1 = np.array([0.0, 0.0, H_BASE])
+    p2 = p1 + np.array([0.0, 0.0, L1])
+    R2 = rz(t1) @ ry(-t2)
+    p3 = p2 + R2 @ np.array([L2, 0, 0])
+    R3 = R2 @ ry(-t3)
+    p4 = p3 + R3 @ np.array([L3, 0, 0])
+    # J4 la khop PITCH (gap dau hut len/xuong), truc // J2, J3
+    R4 = R3 @ ry(-t4)
+    p5 = p4 + R4 @ np.array([L4, 0, 0])
+    P = np.vstack([p0, p1, p2, p3, p4, p5])
+
+    # Thanh gia do giac hut: nam ngang vuong goc voi canh tay
+    yhat = R4 @ np.array([0.0, 1.0, 0.0])
+    w_bar = 0.45
+    tool_bar = np.vstack([p5 - w_bar * yhat, p5 + w_bar * yhat])
+    return P, tool_bar
+
+
+def inverse_kinematics(p_target, phi_tool):
+    """
+    IK giu nguyen goc nghieng dau hut so voi mat dat:
+    phi_tool = t2 + t3 + t4.
+    Tra ve (q, ok).
+    """
+    x, y, z = p_target
+    t1 = np.degrees(np.arctan2(y, x))
+    r = np.hypot(x, y)
+    s = z - (H_BASE + L1)
+
+    # Diem co tay trong mat phang canh tay
+    rw = r - L4 * np.cos(np.radians(phi_tool))
+    sw = s - L4 * np.sin(np.radians(phi_tool))
+    d2 = rw ** 2 + sw ** 2
+    dist = np.sqrt(d2)
+    if dist > (L2 + L3) - 1e-9 or dist < abs(L2 - L3) + 1e-9:
+        return None, False
+
+    D = (d2 - L2 ** 2 - L3 ** 2) / (2 * L2 * L3)
+    D = max(min(D, 1.0), -1.0)
+    t3 = -np.degrees(np.arccos(D))  # elbow-up
+    t2 = np.degrees(np.arctan2(sw, rw)) - np.degrees(
+        np.arctan2(L3 * np.sin(np.radians(t3)), L2 + L3 * np.cos(np.radians(t3))))
+    t4 = phi_tool - t2 - t3
+    q = np.array([t1, t2, t3, t4])
+    ok = bool(np.all(q >= Q_MIN - 1e-6) and np.all(q <= Q_MAX + 1e-6))
+    return q, ok
+
+
+# ---------- Ung dung ----------
+class RobotApp:
+    def __init__(self):
+        self.theta = HOME_POSE.copy()
+        self.trail_on = False
+        self.trail = deque(maxlen=300)
+        self.is_animating = False
+        self.anim_frames = self._build_anim_frames()
+        self.anim_idx = 0
+        self.timer = None
+        self._syncing = False
+
+        self._build_figure()
+        self._build_scene()
+        self._build_panel()
+        self._build_sliders()
+        self._build_buttons()
+
+        self.fig.canvas.mpl_connect("key_press_event", self.on_key)
+        self.update_pose()
+
+    # ----- Giao dien -----
+    def _build_figure(self):
+        self.fig = plt.figure("Robot 4-DOF - Stick Model + Jog Control",
+                              figsize=(11.5, 7.6), facecolor=COL_BG)
+        self.ax = self.fig.add_axes([0.07, 0.30, 0.66, 0.64], projection="3d")
+
+    def _build_scene(self):
+        ax = self.ax
+        ax.set_facecolor(COL_BG)
+        M = REACH + 0.5
+        zmax = H_BASE + L1 + REACH + 0.5
+        ax.set_xlim(-M, M)
+        ax.set_ylim(-M, M)
+        ax.set_zlim(0, zmax)
+        ax.set_box_aspect((2 * M, 2 * M, zmax))   # axis equal
+        ax.view_init(elev=22, azim=-50)
+        ax.set_xlabel("X (m)", color=COL_TXT)
+        ax.set_ylabel("Y (m)", color=COL_TXT)
+        ax.set_zlabel("Z (m)", color=COL_TXT)
+        ax.tick_params(colors=COL_TXT)
+        for axis in (ax.xaxis, ax.yaxis, ax.zaxis):
+            axis._axinfo["grid"]["color"] = COL_GRID
+            axis.set_pane_color((1, 1, 1, 0))
+        ax.set_title("Robot 4-DOF (RRRR + Vacuum EE)", color=COL_TXT,
+                     fontsize=13, fontweight="bold")
+
+        # Truc tham chieu thang dung
+        ax.plot([0, 0], [0, 0], [0, H_BASE + 0.9], "--", color=(0.85, 0.20, 0.20), lw=1)
+
+        # Cac canh tay
+        self.hL1, = ax.plot([], [], [], "-", color=COL_L1, lw=5)
+        self.hL2, = ax.plot([], [], [], "-", color=COL_L2, lw=5)
+        self.hL3, = ax.plot([], [], [], "-", color=COL_L3, lw=4)
+        self.hL4, = ax.plot([], [], [], "-", color=COL_L4, lw=3)
+
+        # Khop va EE
+        self.hJ, = ax.plot([], [], [], "o", ms=8, mfc=COL_JOINT,
+                           mec=(0.5, 0.5, 0.5), ls="none")
+        self.hEE, = ax.plot([], [], [], "s", ms=10, mfc=COL_EE,
+                            mec=(0.3, 0.05, 0.05), ls="none")
+
+        # Thanh cong cu + 2 giac hut
+        self.hToolBar, = ax.plot([], [], [], "-", color=COL_EE, lw=2.5)
+        self.hCups, = ax.plot([], [], [], "o", ms=7, mfc="white", mec=COL_EE,
+                              mew=1.5, ls="none")
+
+        # Vet quy dao
+        self.hTrail, = ax.plot([], [], [], "-", color=COL_TRAIL, lw=1, alpha=0.35)
+
+        # Nhan khop
+        self.hTxt = [ax.text(0, 0, 0, name, color=COL_TXT, fontsize=9,
+                             fontweight="bold")
+                     for name in ("J1", "J2", "J3", "J4", "EE")]
+
+        # Ban xoay de + kim chi huong theo theta1
+        thc = np.linspace(0, 2 * np.pi, 48)
+        ax.plot(0.95 * np.cos(thc), 0.95 * np.sin(thc),
+                np.full_like(thc, H_BASE), "-", color=COL_L1, lw=1.2)
+        self.hYawNeedle, = ax.plot([], [], [], "-", color=COL_L1, lw=3)
+        self.hYawTip, = ax.plot([], [], [], "o", ms=6, mfc=COL_L1, mec="none", ls="none")
+
+    # Doi he toa do trong panel (0..1) -> toa do figure
+    @staticmethod
+    def _pr(px, py, pw, ph):
+        return [0.76 + px * 0.22, 0.30 + py * 0.64, pw * 0.22, ph * 0.64]
+
+    def _panel_text(self, px, py, s, **kw):
+        x, y, _, _ = self._pr(px, py, 0, 0)
+        return self.fig.text(x, y, s, **kw)
+
+    def _build_panel(self):
+        fig = self.fig
+        # Khung panel
+        frame = fig.add_axes([0.76, 0.30, 0.22, 0.64])
+        frame.set_xticks([])
+        frame.set_yticks([])
+        for sp in frame.spines.values():
+            sp.set_color(COL_GRID)
+        frame.set_title("JOG CONTROL (Teach Pendant)", fontsize=10,
+                        fontweight="bold", color=COL_TXT)
+
+        self.txtEE = self._panel_text(0.05, 0.92, "EE: -", color=COL_EE,
+                                      fontsize=10, fontweight="bold")
+
+        self._panel_text(0.20, 0.84, "— Mat phang XY —", color=COL_TXT, fontsize=9)
+        self._btn(self._pr(0.375, 0.72, 0.25, 0.08), "Y +", lambda e: self.jog([0, JOG_STEP, 0]))
+        self._btn(self._pr(0.08, 0.62, 0.25, 0.08), "X -", lambda e: self.jog([-JOG_STEP, 0, 0]))
+        self._btn(self._pr(0.67, 0.62, 0.25, 0.08), "X +", lambda e: self.jog([JOG_STEP, 0, 0]))
+        self._btn(self._pr(0.375, 0.52, 0.25, 0.08), "Y -", lambda e: self.jog([0, -JOG_STEP, 0]))
+
+        self._panel_text(0.10, 0.46, "— Truc Z (len/xuong) —", color=COL_TXT, fontsize=9)
+        self._btn(self._pr(0.15, 0.34, 0.32, 0.08), "Z +", lambda e: self.jog([0, 0, JOG_STEP]))
+        self._btn(self._pr(0.53, 0.34, 0.32, 0.08), "Z -", lambda e: self.jog([0, 0, -JOG_STEP]))
+
+        self._panel_text(0.10, 0.28, "— Pitch dau hut θ4 —", color=COL_TXT, fontsize=9)
+        self._btn(self._pr(0.15, 0.16, 0.32, 0.08), "Pitch -", lambda e: self.pitch_jog(-PITCH_STEP))
+        self._btn(self._pr(0.53, 0.16, 0.32, 0.08), "Pitch +", lambda e: self.pitch_jog(PITCH_STEP))
+
+        self._panel_text(0.05, 0.03,
+                         "Phim tat:\nA/D: X-,X+   W/S: Y+,Y-\nQ/E: Z+,Z-   R/F: Pitch",
+                         color=(0.45, 0.5, 0.55), fontsize=8, va="bottom")
+
+    def _btn(self, rect, label, cb):
+        ax_b = self.fig.add_axes(rect)
+        b = Button(ax_b, label)
+        b.label.set_fontsize(9)
+        b.label.set_fontweight("bold")
+        b.on_clicked(cb)
+        self._keep.append(b)
+        return b
+
+    @property
+    def _keep(self):
+        # Giu tham chieu toi widget de khong bi garbage collect
+        if not hasattr(self, "_widgets"):
+            self._widgets = []
+        return self._widgets
+
+    def _build_sliders(self):
+        labels = ["θ1 Base", "θ2 Shoulder", "θ3 Elbow", "θ4 Pitch"]
+        self.sld = []
+        self.txtVal = []
+        for k in range(4):
+            xoff = k * 0.185 + 0.05
+            self.fig.text(xoff, 0.215, labels[k], color=COL_TXT, fontsize=9,
+                          fontweight="bold")
+            self.txtVal.append(self.fig.text(xoff, 0.178, f"{int(self.theta[k])} deg",
+                                             color=COL_L1, fontsize=9))
+            ax_s = self.fig.add_axes([xoff, 0.13, 0.17, 0.03])
+            s = Slider(ax_s, "", Q_MIN[k], Q_MAX[k], valinit=self.theta[k], valstep=1)
+            s.valtext.set_visible(False)
+            s.on_changed(lambda val, idx=k: self.slider_cb(idx, val))
+            self.sld.append(s)
+            self._keep.append(s)
+
+    def _build_buttons(self):
+        self._btn([0.05, 0.05, 0.14, 0.045], "RESET", lambda e: self.reset_pose())
+        self.btnAnim = self._btn([0.21, 0.05, 0.18, 0.045], "> CHAY ANIMATION",
+                                 lambda e: self.toggle_animation())
+        self._btn([0.41, 0.05, 0.16, 0.045], "BAT/TAT TRAIL", lambda e: self.toggle_trail())
+
+    # ----- Dieu khien -----
+    def jog(self, dp):
+        P, _ = forward_kinematics(self.theta)
+        p_new = P[5] + np.asarray(dp, dtype=float)
+        if p_new[2] < 0.05:          # khong cho dam xuong san
+            self._beep()
+            return
+        phi_tool = self.theta[1] + self.theta[2] + self.theta[3]   # giu nguyen goc dau hut
+        q, ok = inverse_kinematics(p_new, phi_tool)
+        if not ok:                   # ngoai tam voi / qua gioi han khop
+            self._beep()
+            return
+        self.theta = q
+        self.sync_sliders()
+        self.update_pose()
+
+    def pitch_jog(self, dr):
+        self.theta[3] = max(min(self.theta[3] + dr, Q_MAX[3]), Q_MIN[3])
+        self.sync_sliders()
+        self.update_pose()
+
+    def on_key(self, ev):
+        key = (ev.key or "").lower()
+        actions = {
+            "a": lambda: self.jog([-JOG_STEP, 0, 0]),
+            "d": lambda: self.jog([JOG_STEP, 0, 0]),
+            "w": lambda: self.jog([0, JOG_STEP, 0]),
+            "s": lambda: self.jog([0, -JOG_STEP, 0]),
+            "q": lambda: self.jog([0, 0, JOG_STEP]),
+            "e": lambda: self.jog([0, 0, -JOG_STEP]),
+            "r": lambda: self.pitch_jog(PITCH_STEP),
+            "f": lambda: self.pitch_jog(-PITCH_STEP),
+        }
+        if key in actions:
+            actions[key]()
+
+    @staticmethod
+    def _beep():
+        print("\a", end="", flush=True)
+
+    def slider_cb(self, idx, val):
+        if self._syncing:
+            return
+        self.theta[idx] = round(val)
+        self.txtVal[idx].set_text(f"{int(self.theta[idx])} deg")
+        self.update_pose()
+
+    def sync_sliders(self):
+        self._syncing = True
+        try:
+            for k in range(4):
+                v = max(min(self.theta[k], Q_MAX[k]), Q_MIN[k])
+                self.sld[k].set_val(v)
+                self.txtVal[k].set_text(f"{int(round(self.theta[k]))} deg")
+        finally:
+            self._syncing = False
+
+    def reset_pose(self):
+        self._stop_animation()
+        self.theta = HOME_POSE.copy()
+        self.trail.clear()
+        self._set3d(self.hTrail, [], [], [])
+        self.sync_sliders()
+        self.update_pose()
+
+    def toggle_trail(self):
+        self.trail_on = not self.trail_on
+        if not self.trail_on:
+            self.trail.clear()
+            self._set3d(self.hTrail, [], [], [])
+            self.fig.canvas.draw_idle()
+
+    # ----- Animation (dung timer, khong chan GUI) -----
+    @staticmethod
+    def _build_anim_frames(n_steps=40):
+        frames = []
+        for kf in range(len(KEYFRAMES) - 1):
+            q0, q1 = KEYFRAMES[kf], KEYFRAMES[kf + 1]
+            for st in range(1, n_steps + 1):
+                u = st / n_steps
+                w = 3 * u ** 2 - 2 * u ** 3     # smoothstep
+                frames.append(q0 + (q1 - q0) * w)
+        return frames
+
+    def toggle_animation(self):
+        if self.is_animating:
+            self._stop_animation()
+            return
+        self.is_animating = True
+        self.btnAnim.label.set_text("|| DUNG")
+        self.timer = self.fig.canvas.new_timer(interval=25)
+        self.timer.add_callback(self._anim_step)
+        self.timer.start()
+        self.fig.canvas.draw_idle()
+
+    def _stop_animation(self):
+        self.is_animating = False
+        if self.timer is not None:
+            self.timer.stop()
+            self.timer = None
+        self.btnAnim.label.set_text("> CHAY ANIMATION")
+        self.fig.canvas.draw_idle()
+
+    def _anim_step(self):
+        if not self.is_animating:
+            return
+        self.theta = self.anim_frames[self.anim_idx].copy()
+        self.anim_idx = (self.anim_idx + 1) % len(self.anim_frames)
+        self.sync_sliders()
+        self.update_pose()
+
+    # ----- Ve -----
+    @staticmethod
+    def _set3d(line, xs, ys, zs):
+        line.set_data(np.asarray(xs), np.asarray(ys))
+        line.set_3d_properties(np.asarray(zs))
+
+    def update_pose(self):
+        P, tool_bar = forward_kinematics(self.theta)
+        s3 = self._set3d
+        s3(self.hL1, P[1:3, 0], P[1:3, 1], P[1:3, 2])
+        s3(self.hL2, P[2:4, 0], P[2:4, 1], P[2:4, 2])
+        s3(self.hL3, P[3:5, 0], P[3:5, 1], P[3:5, 2])
+        s3(self.hL4, P[4:6, 0], P[4:6, 1], P[4:6, 2])
+        s3(self.hJ, P[1:5, 0], P[1:5, 1], P[1:5, 2])
+        s3(self.hEE, [P[5, 0]], [P[5, 1]], [P[5, 2]])
+
+        # Thanh cong cu + giac hut quay theo θ4
+        s3(self.hToolBar, tool_bar[:, 0], tool_bar[:, 1], tool_bar[:, 2])
+        s3(self.hCups, tool_bar[:, 0], tool_bar[:, 1], tool_bar[:, 2])
+
+        offs = 0.18
+        for kk in range(4):
+            x, y, z = P[kk + 1] + offs
+            self.hTxt[kk].set_position((x, y))
+            self.hTxt[kk].set_3d_properties(z)
+        x, y, z = P[5] + offs
+        self.hTxt[4].set_position((x, y))
+        self.hTxt[4].set_3d_properties(z)
+
+        # Kim ban xoay de theo θ1
+        c1 = np.cos(np.radians(self.theta[0]))
+        s1 = np.sin(np.radians(self.theta[0]))
+        s3(self.hYawNeedle, [0, 0.95 * c1], [0, 0.95 * s1], [H_BASE, H_BASE])
+        s3(self.hYawTip, [0.95 * c1], [0.95 * s1], [H_BASE])
+
+        self.txtEE.set_text(f"EE: [{P[5, 0]:.2f}, {P[5, 1]:.2f}, {P[5, 2]:.2f}] m")
+
+        if self.trail_on:
+            self.trail.append(P[5].copy())
+            t = np.array(self.trail)
+            s3(self.hTrail, t[:, 0], t[:, 1], t[:, 2])
+
+        self.fig.canvas.draw_idle()
+
+
+def main():
+    app = RobotApp()   # noqa: F841  (giu tham chieu de widget khong bi huy)
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
